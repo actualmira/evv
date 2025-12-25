@@ -69,6 +69,7 @@ Juice Shop is a deliberately insecure web application containing vulnerabilities
 ### Application
 | Component | Technology |
 |-----------|-----------|
+| **Application** | OWASP Juice Shop |
 | **Framework** | Express.js (Node.js) |
 | **Frontend** | Angular |
 | **Language** | TypeScript, JavaScript |
@@ -95,23 +96,23 @@ Juice Shop is a deliberately insecure web application containing vulnerabilities
 
 ## Phase 1: Manual Security Testing
 
-**Objective:** Understand vulnerabilities through hands-on exploitation before implementing automated scanning.
+**Objective:** To understand some of the application's vulnerabilities through hands-on exploitation before implementing automated scanning.
 
 ### Why I Started with Manual Testing
 
-Before running any automated tools, I wanted to understand what I was actually looking for. Security tools are powerful, but they're meaningless if you don't understand the vulnerabilities they're detecting. I approached this like a penetration tester would—trying to break into the application using common attack patterns.
+Before running any automated tools, I wanted to understand what I was actually looking for. Security tools are powerful, but manual exploration demonstrates how attackers think and what real damage vulnerabilities cause; knowledge that automated reports alone cannot provide.
 
-This hands-on approach taught me that security isn't just about finding vulnerabilities in a report—it's about understanding how attackers think and what damage they can actually do.
-
-**Industry Standard?** ✅ Yes. Professional penetration testers always begin with manual exploration before running automated scans. This is considered best practice because it provides the context and understanding that tools alone cannot deliver.
+**Best Practice:** Professional penetration testers use automated scanning for efficiency, then rely on manual testing to validate findings, understand impact, and discover vulnerabilities tools miss.
 
 ---
 
 ### SQL Injection: Authentication Bypass
 
-**Vulnerability Location:** Login endpoint (`/rest/user/login`)
+**OWASP Top 10 Classification:** A03:2021 – Injection
 
-I approached the login form like an attacker would—testing for SQL injection by manipulating the input fields. Instead of providing a valid email and password, I injected SQL code to manipulate the underlying database query.
+**Vulnerability:** Login endpoint (`/rest/user/login`)
+
+**Attack Method:** I manipulated the email input field with SQL injection payloads to alter the database query logic, bypassing authentication without valid credentials.
 
 **Exploitation Attempt:**
 ```
@@ -145,8 +146,6 @@ The password check (`AND password='anything'`) is completely ignored because it'
 
 **Results:**
 
-![SQL Injection Test](screenshots/phase1-manual-testing/01-sql-injection-login.png)
-*SQL injection payload in login form*
 
 ![Admin Access](screenshots/phase1-manual-testing/02-sql-injection-success.png)
 *Successful authentication bypass - gained admin access without valid credentials*
@@ -161,20 +160,6 @@ The password check (`AND password='anything'`) is completely ignored because it'
 - **Data Manipulation**: Modify or delete records (change prices, delete orders, alter user permissions)
 - **Privilege Escalation**: Elevate regular user accounts to administrator accounts
 - **In some cases, Remote Code Execution**: On certain database configurations, attackers can execute system commands
-
-**Real-World Examples:**
-- The 2012 Yahoo breach exposed 450,000 passwords due to SQL injection
-- Heartland Payment Systems breach (2008) compromised 130 million credit card numbers
-- SQL injection consistently ranks in OWASP Top 10 as a critical threat
-
-**Business Impact:**
-```
-Data Breach → Regulatory Fines (GDPR: up to 4% of global revenue)
-           → Loss of Customer Trust
-           → Legal Liability
-           → Operational Disruption
-           → Competitive Disadvantage
-```
 
 **Why This Vulnerability Exists:**
 
@@ -208,26 +193,12 @@ User.findOne({
 **Additional Defensive Layers:**
 
 1. **Input Validation**: Reject unexpected characters before they reach the database
-```javascript
-   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-   if (!emailRegex.test(email)) {
-     return res.status(400).json({ error: 'Invalid email format' });
-   }
-```
-
 2. **Least Privilege Database Access**: The application's database user should only have the minimum permissions needed
-```sql
-   -- Don't give the app user DELETE or ALTER permissions
-   GRANT SELECT, INSERT, UPDATE ON users TO app_user;
-```
-
 3. **Web Application Firewall (WAF)**: Detect and block SQL injection attempts at the network layer
-
 4. **Stored Procedures**: Encapsulate database logic in procedures with parameterized inputs
-
 5. **ORM Frameworks**: Use ORMs like Sequelize, TypeORM, or Prisma that automatically use parameterized queries
 
-**The Reality:** Parameterized queries are the gold standard. Everything else is defense in depth. If you're using string concatenation to build SQL queries, you're vulnerable—period.
+**The Reality:** Parameterized queries are the gold standard. Everything else is defense in depth. 
 
 ---
 
