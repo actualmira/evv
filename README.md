@@ -110,7 +110,7 @@ Before running any automated tools, I wanted to understand what I was actually l
 
 **OWASP Top 10 Classification:** A03:2021 – Injection
 
-**Vulnerability:** Login endpoint (`/rest/user/login`)
+**Vulnerability:** Login endpoint (`routes/login.ts`, line 34`)
 
 **Attack Method:** I manipulated the email input field with SQL injection payloads to alter the database query logic, bypassing authentication without valid credentials.
 
@@ -127,11 +127,14 @@ The application accepted this payload and logged me in successfully without requ
 **How This Works (The Technical Details):**
 
 The vulnerable code constructs SQL queries using string concatenation:
-```javascript
-// Vulnerable code (routes/login.ts, line ~34)
-const query = `SELECT * FROM users WHERE email='${email}' AND password='${password}'`
+```typescript
+// routes/login.ts, line 34
+models.sequelize.query(
+  `SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, 
+  { model: UserModel, plain: true }
+)
 ```
-
+**Breakdown**
 When my payload `' or 1=1--` is injected into the email field, the query becomes:
 ```sql
 SELECT * FROM users WHERE email='' or 1=1--' AND password='anything'
@@ -142,10 +145,11 @@ Let me break down what each part does:
 - `or 1=1` - Always evaluates to TRUE (1=1 is always true)
 - `--` - SQL comment operator that comments out everything after it
 
-The password check (`AND password='anything'`) is completely ignored because it's commented out. Since `1=1` is always true, the query returns all users, and the application logs me in as the first user in the database (typically the admin).
+The password check (`AND password = '...'`) and the deleted user check (`AND deletedAt IS NULL`) are completely ignored because they're commented out. Since `1=1` is always true, the query returns all users, and the application logs me in as the first user in the database (typically the admin).
+
+**Note:** Even though the password is hashed using `security.hash()`, the SQL injection occurs before the password check is evaluated, making the hashing irrelevant to this attack.
 
 **Results:**
-
 
 ![Admin Access](screenshots/phase1-manual-testing/02-sql-injection-success.png)
 *Successful authentication bypass - gained admin access without valid credentials*
@@ -172,20 +176,26 @@ The root cause is **trusting user input without validation**. The application ta
 **Primary Defense: Parameterized Queries (Prepared Statements)**
 
 The secure approach uses parameterized queries where user input is never interpreted as SQL code:
-```javascript
+```typescript
 // SECURE CODE (parameterized query)
-const query = 'SELECT * FROM users WHERE email=? AND password=?';
-db.query(query, [email, password], (err, results) => {
-  // Even if email contains SQL code, it's treated as a string literal
-});
-
-// Or with modern ORMs like Sequelize:
-User.findOne({
-  where: {
-    email: email,
-    password: password
+await models.sequelize.query(
+  'SELECT * FROM Users WHERE email = ? AND password = ? AND deletedAt IS NULL',
+  {
+    replacements: [req.body.email, security.hash(req.body.password)],
+    type: QueryTypes.SELECT,
+    model: UserModel,
+    plain: true
   }
-});
+)
+
+// Or with Sequelize ORM:
+await UserModel.findOne({
+  where: {
+    email: req.body.email,
+    password: security.hash(req.body.password),
+    deletedAt: null
+  }
+})
 ```
 
 **Why This Works:** The database knows that `?` placeholders are data, not code. No matter what the user types, it's always treated as a string value, never as SQL syntax.
@@ -193,10 +203,17 @@ User.findOne({
 **Additional Defensive Layers:**
 
 1. **Input Validation**: Reject unexpected characters before they reach the database
-2. **Least Privilege Database Access**: The application's database user should only have the minimum permissions needed
-3. **Web Application Firewall (WAF)**: Detect and block SQL injection attempts at the network layer
-4. **Stored Procedures**: Encapsulate database logic in procedures with parameterized inputs
-5. **ORM Frameworks**: Use ORMs like Sequelize, TypeORM, or Prisma that automatically use parameterized queries
+```typescript
+   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+   if (!emailRegex.test(email)) {
+     return res.status(400).json({ error: 'Invalid email format' });
+   }
+```
+Attackers can craft payloads that pass validation but still exploit SQL injection.
+
+2. **Web Application Firewall (WAF)**: Detect and block SQL injection attempts at the network layer
+- Detects common SQL injection patterns
+- Attackers can use encoding or obfuscation to bypass
 
 **The Reality:** Parameterized queries are the gold standard. Everything else is defense in depth. 
 
